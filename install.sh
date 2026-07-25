@@ -33,9 +33,10 @@ echo -e "${GREEN}✓ Termux 环境正常${NC}"
 
 # ── 2. 安装依赖 ──
 echo -e "${YELLOW}[2/5] 安装依赖（pkg update/upgrade/python/glibc）...${NC}"
-pkg update -y 2>/dev/null || true
-pkg upgrade -y 2>/dev/null || true
-pkg install -y python glibc-repo glibc 2>/dev/null || {
+pkg update -y 2>&1 || true
+echo -e "${YELLOW}  ⚠ 跳过全量升级以保护现有环境${NC}"
+pkg install -y python glibc-repo glibc 2>&1 || {
+    echo -e "${YELLOW}⚠ 批量安装失败，尝试逐个安装...${NC}"
     echo -e "${YELLOW}⚠ 部分依赖安装需重试，尝试单独安装...${NC}"
     pkg install -y python || echo -e "${RED}⚠ python 安装失败，请手动执行: pkg install python${NC}"
     pkg install -y glibc-repo || echo -e "${RED}⚠ glibc-repo 安装失败，请手动执行: pkg install glibc-repo${NC}"
@@ -52,7 +53,7 @@ echo -e "${GREEN}✓ 目录已创建: $INSTALL_DIR${NC}"
 # ── 4. 复制脚本 ──
 echo -e "${YELLOW}[4/5] 安装脚本文件...${NC}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-FILES=("openai_proxy.py" "cc.py" "claude.py" "url_utils.py")
+FILES=("openai_proxy.py" "cc.py" "claude.py" "url_utils.py" "test_proxy.py")
 COPIED=0
 for f in "${FILES[@]}"; do
     SRC="$SCRIPT_DIR/$f"
