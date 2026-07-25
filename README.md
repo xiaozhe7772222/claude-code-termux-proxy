@@ -30,7 +30,7 @@ AI 中转站 / 第三方 API（DeepSeek/智谱/豆包/OpenAI 等）
 - ✅ **Retry-After 解析** — 尊重服务端限流等待时间
 - ✅ **连接池** — 复用 TCP 连接，减少握手开销
 - ✅ **请求追踪 ID** — 每个请求带 trace_id，日志可追溯
-- ✅ **推理模型参数注入** — 自动识别 o1/o3/gpt-5 等推理模型，注入 `reasoning_effort=high`
+- ✅ **推理参数注入** — 所有模型自动注入 `reasoning_effort=high`
 - ✅ **大型任务增强** — 自动检测大型任务，拉高 max_tokens + 强化 system prompt
 - ✅ **Token 用量统计** — 按模型/按天统计，自动计算费用
 - ✅ **优雅关闭** — SIGTERM/SIGINT 信号处理，保存统计数据
@@ -46,7 +46,6 @@ AI 中转站 / 第三方 API（DeepSeek/智谱/豆包/OpenAI 等）
 - ✅ **全功能菜单界面** — 14 个菜单项，一键管理
 - ✅ **模型预设管理** — 支持 200 个预设，直连/代理模式一键切换
 - ✅ **批量导入模型** — 输入地址+Key，自动拉取 `/v1/models` 批量建预设
-- ✅ **快速预设模板** — DeepSeek/MiMo/智谱/豆包 一键填入
 - ✅ **预设搜索** — 按名称/模型/URL 搜索过滤
 - ✅ **配置导入/导出** — 备份到存储卡，换手机也能恢复
 - ✅ **启动自动备份** — 每次启动自动备份配置到 `~/.claude/backups/`
@@ -256,7 +255,7 @@ AI Relay / Third-party API (DeepSeek/GLM/Doubao/OpenAI etc.)
 - ✅ **Retry-After Parsing** — Respects server-side rate limiting wait times
 - ✅ **Connection Pool** — Reuses TCP connections, reduces handshake overhead
 - ✅ **Request Trace ID** — Each request has a trace_id for full log traceability
-- ✅ **Reasoning Model Support** — Auto-detects o1/o3/gpt-5 etc., injects `reasoning_effort=high`
+- ✅ **Reasoning Boost** — Injects `reasoning_effort=high` for all models
 - ✅ **Large Task Enhancement** — Auto-detects complex tasks, boosts max_tokens + strengthens system prompt
 - ✅ **Token Usage Stats** — Per-model and daily statistics with cost calculation
 - ✅ **Graceful Shutdown** — SIGTERM/SIGINT signal handling, saves stats data
@@ -272,7 +271,6 @@ AI Relay / Third-party API (DeepSeek/GLM/Doubao/OpenAI etc.)
 - ✅ **Full Menu Interface** — 14 menu items, one-key management
 - ✅ **Model Preset Management** — Supports 200 presets, one-click switch between direct/proxy modes
 - ✅ **Batch Model Import** — Enter URL+Key, auto-fetch `/v1/models` and create presets in bulk
-- ✅ **Quick Preset Templates** — One-click fill for DeepSeek/MiMo/GLM/Doubao
 - ✅ **Preset Search** — Filter by name/model/URL keywords
 - ✅ **Config Export/Import** — Backup to SD card, restore on a new phone
 - ✅ **Auto Backup on Startup** — Automatically backs up config to `~/.claude/backups/`
