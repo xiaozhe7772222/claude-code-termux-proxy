@@ -133,40 +133,38 @@ def is_local_proxy_url(url: str) -> bool:
 
 def _listening_pids_on_port(port: int):
     """反查监听/绑定该端口的 openai_proxy PID。
-
-    本机 Termux 上 /proc/net/tcp 常 Permission denied，ss/lsof 也没有。
-    可靠做法：扫 /proc/*/cmdline 找 openai_proxy.py，再读 environ 的 PROXY_PORT=。
+    Termux 非 root 下 /proc/environ 不可读，改用 meta.json + 健康检查。
     """
     port = int(port)
     port_s = str(port)
     pids = []
+    # 优先从 meta 文件读取 pid
+    meta_file = proxy_meta_path(port)
+    meta = load_json(meta_file, {}) or {}
+    meta_pid = meta.get("pid")
+    if meta_pid:
+        try:
+            os.kill(int(meta_pid), 0)
+            pids.append(int(meta_pid))
+            return pids
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    # meta 不可用，扫 /proc/cmdline 但不读 environ
     try:
         for name in os.listdir("/proc"):
             if not name.isdigit():
                 continue
             pid = int(name)
-            # 1) cmdline 必须是 openai_proxy
             try:
                 cmd = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\x00", b" ").decode("utf-8", "ignore")
             except Exception:
                 continue
             if "openai_proxy.py" not in cmd:
                 continue
-            # 2) environ 里 PROXY_PORT 匹配
-            matched = False
-            try:
-                env_raw = open(f"/proc/{pid}/environ", "rb").read().split(b"\x00")
-                for item in env_raw:
-                    if item.startswith(b"PROXY_PORT="):
-                        val = item.split(b"=", 1)[1].decode("utf-8", "ignore").strip()
-                        if val == port_s:
-                            matched = True
-                        break
-            except Exception:
-                # environ 不可读时：若只有一个代理且健康检查对上，仍不可盲目杀；跳过
-                matched = False
-            if matched:
+            # 通过健康检查确认端口
+            if proxy_running(port):
                 pids.append(pid)
+                break
     except Exception:
         pass
     return pids
@@ -1767,36 +1765,34 @@ def launch_cc(extra_args=None):
     args = extra_args or []
     cmd = [sys.executable, CC] + args
 
-    # ── 自动降级：如果当前模型不可用，切到备用 ──
-    cfg = load_settings()
-    active_url = cfg.get("env", {}).get("ANTHROPIC_BASE_URL", "")
-    if active_url and "127.0.0.1" not in active_url:
-        # 直连模式：测试当前模型
-        try:
-            test_url = _models_endpoint(active_url)
-            key = cfg.get("env", {}).get("ANTHROPIC_AUTH_TOKEN", "")
-            import urllib.request
-            req = urllib.request.Request(test_url, headers={"Authorization": f"Bearer {key}"}, method="GET")
-            with urllib.request.urlopen(req, timeout=5) as r:
-                pass  # 模型可用
-        except Exception:
-            # 当前模型挂了，自动降级
+    # ── 自动降级（默认关闭，设 CC_AUTO_DEGRADE=1 开启）──
+    if os.environ.get("CC_AUTO_DEGRADE") == "1":
+        cfg = load_settings()
+        active_url = cfg.get("env", {}).get("ANTHROPIC_BASE_URL", "")
+        if active_url and "127.0.0.1" not in active_url:
+            try:
+                test_url = _models_endpoint(active_url)
+                key = cfg.get("env", {}).get("ANTHROPIC_AUTH_TOKEN", "")
+                import urllib.request
+                req = urllib.request.Request(test_url, headers={"Authorization": f"Bearer {key}"}, method="GET")
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    pass
+            except Exception:
+                presets = load_model_presets()
+                if len(presets) > 1:
+                    for i, p in enumerate(presets):
+                        if p.get("mode") == "direct" and p.get("anthropic_base_url", "") != active_url:
+                            print(f"\033[33m当前模型不可用，自动降级到: {p.get('name')}\033[0m")
+                            apply_model_preset(i)
+                            break
+        elif is_local_proxy_mode() and not proxy_running(current_proxy_port()):
             presets = load_model_presets()
             if len(presets) > 1:
                 for i, p in enumerate(presets):
-                    if p.get("mode") == "direct" and p.get("anthropic_base_url", "") != active_url:
-                        print(f"\033[33m当前模型不可用，自动降级到: {p.get('name')}\033[0m")
+                    if p.get("mode") != "openai":
+                        print(f"\033[33m代理不可用，自动降级到直连: {p.get('name')}\033[0m")
                         apply_model_preset(i)
                         break
-    elif is_local_proxy_mode() and not proxy_running(current_proxy_port()):
-        # 代理挂了，切到另一个代理或直连
-        presets = load_model_presets()
-        if len(presets) > 1:
-            for i, p in enumerate(presets):
-                if p.get("mode") != "openai":
-                    print(f"\033[33m代理不可用，自动降级到直连: {p.get('name')}\033[0m")
-                    apply_model_preset(i)
-                    break
 
     # ── 启动前环境诊断 ──
     issues = []
@@ -1895,26 +1891,29 @@ def launch_cc(extra_args=None):
 
     def _watch_targets():
         """当前应守护的 (port, key, base, model, name) 列表。
-        多Agent已废弃：只守护当前激活的单个代理端口。
+        仅守护当前激活的代理端口（通过 current_proxy_port 匹配）。
         """
         targets = []
         if not is_local_proxy_mode():
             return targets
+        active_port = current_proxy_port()
         presets_now = load_model_presets()
-        openai_now = [(i, p) for i, p in enumerate(presets_now) if p.get("mode") == "openai"]
-        if openai_now:
-            i, p = openai_now[0]
-            port = get_preset_port(i) or current_proxy_port()
-            targets.append((
-                port,
-                p.get("api_key") or "",
-                p.get("openai_base_url") or "",
-                p.get("model") or "gpt-4o",
-                p.get("name") or f"port{port}",
-            ))
-        else:
-            key, base, model = openai_creds_from_settings()
-            targets.append((current_proxy_port(), key, base, model, "main"))
+        # 优先匹配当前激活的端口
+        for i, p in enumerate(presets_now):
+            if p.get("mode") == "openai":
+                port = get_preset_port(i)
+                if port is not None and port == active_port:
+                    targets.append((
+                        port,
+                        p.get("api_key") or "",
+                        p.get("openai_base_url") or "",
+                        p.get("model") or "gpt-4o",
+                        p.get("name") or f"port{port}",
+                    ))
+                    return targets
+        # 没有匹配的 openai 预设，用 settings 凭据
+        key, base, model = openai_creds_from_settings()
+        targets.append((active_port, key, base, model, "main"))
         return targets
 
     def _proxy_watchdog():
@@ -2418,7 +2417,7 @@ def show_token_stats():
 
 
 CC_VERSION = "2.2.0"
-UPDATE_URL = "https://raw.githubusercontent.com/你的用户名/claude-code-termux/main"
+UPDATE_URL = "https://raw.githubusercontent.com/xiaozhe7772222/claude-code-termux-proxy/main"
 
 def main():
     # 确保 ~/.claude/settings.json 权限正确
@@ -2434,7 +2433,7 @@ def main():
     # 启动时检查更新提示
     _auto_check_update()
     while True:
-        os.system("clear")
+        print("\033[2J\033[H", end="")
         model, mode, base, max_out, oai, oai_state = status_line()
         presets_summary = get_presets_summary()
         print(
@@ -2446,7 +2445,7 @@ def main():
  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝╚══════╝
 \033[0m
 \033[38;5;214m╔═══════════════════════════════════╗
-║         Claude code v2.1.159      ║
+║         Claude code v2.2.0        ║
 ╚═══════════════════════════════════╝\033[0m
               小哲
 当前模型：{model}
@@ -2514,7 +2513,7 @@ BASE_URL：{base or '无'}
 def _config_management_menu():
     """配置导入/导出/备份子菜单"""
     while True:
-        os.system("clear")
+        print("\033[2J\033[H", end="")
         print("\033[1;36m══════ 配置管理 ══════\033[0m")
         print("1. 备份配置到备份目录")
         print("2. 导出配置到存储卡")
