@@ -41,7 +41,7 @@ DEFAULT_MODEL = env("OPENAI_MODEL") or env("ANTHROPIC_MODEL") or "gpt-4o"
 PROXY_HOST = env("PROXY_HOST") or "127.0.0.1"
 PROXY_PORT = int(env("PROXY_PORT") or "8765")
 DEBUG = env("PROXY_DEBUG", "1") not in ("0", "false", "False")
-FORCE_NON_STREAM = env("PROXY_FORCE_NON_STREAM", "1") not in ("0", "false", "False")
+FORCE_NON_STREAM = env("PROXY_FORCE_NON_STREAM", "0") not in ("0", "false", "False")
 DROP_TOOLS = env("PROXY_DROP_TOOLS", "0") not in ("0", "false", "False")
 
 # ── Token usage stats ──
@@ -51,13 +51,15 @@ _stats_lock = threading.Lock()
 MODEL_PRICING = {
     "gpt-4o":          {"input": 2.50,  "output": 10.00},
     "gpt-4o-mini":     {"input": 0.15,  "output": 0.60},
-    "deepseek":        {"input": 0.28,  "output": 1.10},
-    "deepseek-v4":     {"input": 0.28,  "output": 1.10},
-    "glm":             {"input": 0.50,  "output": 2.00},
+    "gpt-4o-turbo":    {"input": 2.50,  "output": 10.00},
+    "gpt-4":           {"input": 30.00, "output": 60.00},
+    "deepseek-chat":   {"input": 0.14,  "output": 0.28},
+    "deepseek-reasoner":{"input": 0.55,  "output": 2.19},
+    "glm-4":           {"input": 0.50,  "output": 2.00},
     "doubao":          {"input": 0.80,  "output": 3.00},
     "mimo":            {"input": 0.60,  "output": 2.50},
     "grok":            {"input": 2.00,  "output": 10.00},
-    "claude":          {"input": 3.00,  "output": 15.00},
+    "claude-3":        {"input": 3.00,  "output": 15.00},
     "default":         {"input": 1.00,  "output": 3.00},
 }
 
@@ -357,53 +359,92 @@ def _reset_preset_success(preset_id: str) -> None:
         save_failover_presets(presets)
 
 
-# ── 新增：连接池（简化版）──
+# ── 新增：连接池（基于 http.client 实现真实 TCP keep-alive）──
+import http.client
 
 class _ConnectionPool:
-    """HTTP 连接池，复用上游连接"""
+    """HTTP 连接池，基于 http.client 实现真实 TCP 连接复用"""
     def __init__(self):
-        self._pool: Dict[str, urllib.request.HTTPHandler] = {}
+        self._pool: Dict[str, http.client.HTTPConnection] = {}
         self._lock = threading.Lock()
 
-    def get_handler(self, base_url: str) -> urllib.request.HTTPHandler:
+    def get_connection(self, base_url: str) -> http.client.HTTPConnection:
         key = base_url.rstrip("/")
         with self._lock:
-            if key not in self._pool:
-                self._pool[key] = urllib.request.HTTPHandler()
-            return self._pool[key]
+            if key in self._pool:
+                conn = self._pool[key]
+                try:
+                    # 测试连接是否存活
+                    conn.sock.settimeout(1)
+                    return conn
+                except Exception:
+                    pass
+            # 创建新连接
+            parsed = urllib.parse.urlparse(key)
+            host = parsed.hostname or ""
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            conn = http.client.HTTPSConnection(host, port, timeout=30) if parsed.scheme == "https" else http.client.HTTPConnection(host, port, timeout=30)
+            conn.set_debuglevel(0)
+            self._pool[key] = conn
+            return conn
 
     def invalidate(self, base_url: str) -> None:
         key = base_url.rstrip("/")
         with self._lock:
-            self._pool.pop(key, None)
+            conn = self._pool.pop(key, None)
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def close_all(self) -> None:
+        with self._lock:
+            for conn in self._pool.values():
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._pool.clear()
 
 _conn_pool = _ConnectionPool()
 
 
 # ── HTTP 请求（增强）──
 
-def _build_opener(base_url: str):
-    """构建带连接复用的 opener"""
-    handler = _conn_pool.get_handler(base_url)
-    return urllib.request.build_opener(handler)
-
-
 def http_json(url: str, payload: Dict[str, Any], timeout: int = 60, trace_id: str = "") -> urllib.response.addinfourl:
-    """发送 HTTP POST JSON 请求，带连接池和超时控制"""
+    """发送 HTTP POST JSON 请求，带连接池（真实 TCP keep-alive）"""
     data = json.dumps(payload).encode("utf-8")
+    parsed = urllib.parse.urlparse(url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    conn = _conn_pool.get_connection(base_url)
 
-    req = urllib.request.Request(
-        url, data=data, method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "User-Agent": "claude-code-openai-proxy/2.1",
-        },
-    )
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "User-Agent": "claude-code-openai-proxy/2.1",
+        "Connection": "keep-alive",
+    }
     if DEBUG:
         log(f"POST {url} model={payload.get('model')} stream={payload.get('stream')} timeout={timeout}", trace_id=trace_id)
-    opener = _build_opener(url.rsplit("/", 2)[0] + "//" + url.split("/")[2])
-    return opener.open(req, timeout=timeout)
+    try:
+        conn.request("POST", parsed.path or "/", body=data, headers=headers)
+        resp = conn.getresponse()
+        body_bytes = resp.read()
+        # 检查 HTTP 状态码，非 2xx 视为错误
+        if resp.status >= 400:
+            # 构造兼容 urllib.error.HTTPError 的异常
+            _conn_pool.invalidate(base_url)
+            raise urllib.error.HTTPError(url, resp.status, body_bytes.decode("utf-8", errors="ignore")[:1000], resp.headers, io.BytesIO(body_bytes))
+        from io import BytesIO
+        return urllib.response.addinfourl(BytesIO(body_bytes), resp.headers, url, resp.status)
+    except urllib.error.HTTPError:
+        raise
+    except Exception as e:
+        # 连接异常，从池中移除
+        _conn_pool.invalidate(base_url)
+        raise
 
 
 def _parse_retry_after(e: urllib.error.HTTPError) -> float:
@@ -455,7 +496,8 @@ def call_openai(payload: Dict[str, Any], timeout: Optional[int] = None, trace_id
         try:
             resp = http_json(url, payload, timeout=to, trace_id=trace_id)
             # 成功：重置故障转移状态
-            _failover_state["consecutive_failures"] = 0
+            with _failover_lock:
+                _failover_state["consecutive_failures"] = 0
             return resp
         except urllib.error.HTTPError as e:
             last_exception = e
@@ -500,7 +542,8 @@ def call_openai(payload: Dict[str, Any], timeout: Optional[int] = None, trace_id
                 wait = _exponential_backoff(attempt, retry_after=_parse_retry_after(e))
                 log(f"upstream {e.code}, retry {attempt+1}/{_MAX_RETRIES} in {wait:.1f}s", "WARN", trace_id)
                 time.sleep(wait)
-                _failover_state["consecutive_failures"] = _failover_state.get("consecutive_failures", 0) + 1
+                with _failover_lock:
+                    _failover_state["consecutive_failures"] = _failover_state.get("consecutive_failures", 0) + 1
                 continue
 
             # 不可重试，直接抛出
@@ -512,7 +555,8 @@ def call_openai(payload: Dict[str, Any], timeout: Optional[int] = None, trace_id
                 wait = _exponential_backoff(attempt)
                 log(f"network error, retry {attempt+1}/{_MAX_RETRIES} in {wait:.1f}s: {e.reason}", "WARN", trace_id)
                 time.sleep(wait)
-                _failover_state["consecutive_failures"] = _failover_state.get("consecutive_failures", 0) + 1
+                with _failover_lock:
+                    _failover_state["consecutive_failures"] = _failover_state.get("consecutive_failures", 0) + 1
                 continue
             raise
         except Exception as e:
@@ -526,11 +570,13 @@ def call_openai(payload: Dict[str, Any], timeout: Optional[int] = None, trace_id
             raise
 
     # 重试耗尽，触发熔断
-    _failover_state["circuit_open_until"] = time.time() + _CIRCUIT_COOLDOWN_SECONDS
+    with _failover_lock:
+        _failover_state["circuit_open_until"] = time.time() + _CIRCUIT_COOLDOWN_SECONDS
     log(f"circuit OPEN for {_CIRCUIT_COOLDOWN_SECONDS}s after {_MAX_RETRIES} failures", "ERROR", trace_id)
     if last_exception:
         raise last_exception
     raise RuntimeError("upstream failed after retries")
+
 
 # ── 模型工具 ──
 
@@ -801,20 +847,12 @@ def build_payload(body: Dict[str, Any], stream: bool) -> Dict[str, Any]:
 
 
 def _apply_model_param_policy(payload: Dict[str, Any], model: str, reasoning: Optional[bool] = None) -> None:
-    """按模型类型修正参数。
-    - 推理模型（OpenAI o系列/gpt-5）：只注入 reasoning_effort=high，其他参数不变
-    - 普通模型 + 有 tools：开 parallel_tool_calls
-    """
-    if reasoning is None:
-        reasoning = is_reasoning_model(model)
-    if reasoning:
-        # OpenAI 推理模型注入 reasoning_effort=high，其他参数保持原样
-        if supports_reasoning_effort(model) and DEFAULT_REASONING_EFFORT:
-            payload["reasoning_effort"] = DEFAULT_REASONING_EFFORT
-    else:
-        # 普通模型：Claude Code 依赖并行工具调用
-        if payload.get("tools") and PARALLEL_TOOL_CALLS:
-            payload.setdefault("parallel_tool_calls", True)
+    """所有模型一律注入 reasoning_effort=high，开启并行工具调用"""
+    if DEFAULT_REASONING_EFFORT:
+        payload["reasoning_effort"] = DEFAULT_REASONING_EFFORT
+    # Claude Code 依赖并行工具调用
+    if payload.get("tools") and PARALLEL_TOOL_CALLS:
+        payload.setdefault("parallel_tool_calls", True)
 
 # ── OpenAI 响应 → Anthropic 消息 ──
 
@@ -850,6 +888,9 @@ def stop_reason(finish: Optional[str], has_tools: bool) -> str:
         return "tool_use"
     if finish == "length":
         return "max_tokens"
+    if finish == "content_filter":
+        log("upstream returned content_filter, possibly filtered content", "WARN")
+        return "end_turn"
     return "end_turn"
 
 def to_anthropic_message(oai: Dict[str, Any], model: str) -> Dict[str, Any]:
@@ -1197,6 +1238,7 @@ def convert_openai_sse(handler: "Handler", resp, model: str, request_body: Optio
     ot = max(0, len("".join(text_parts).encode('utf-8')) // 3)
     if ot == 0 and tool_states:
         ot = 1
+    log(f"stream usage estimate: output_tokens={ot} (estimated)", "DEBUG", trace_id=None)
     handler.wfile.write(
         sse("message_delta", {
             "type": "message_delta",
